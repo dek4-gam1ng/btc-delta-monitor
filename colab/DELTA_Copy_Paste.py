@@ -28,7 +28,7 @@ from pathlib import Path
 SYMBOL = "BTCUSDT"
 INTERVAL_MINUTES = 5
 BASELINE_CANDLES = 24
-DELTA_MULTIPLIER = 2.0
+DELTA_MULTIPLIER = 4.0
 CLOSE_GRACE_SECONDS = 5
 MAX_HISTORY = 2016  # Up to seven days of 5m records; gaps are not fabricated.
 HISTORY_PATH = "/content/drive/MyDrive/btc-delta-bot/bybit-BTCUSDT-5m.json"
