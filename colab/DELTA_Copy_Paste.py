@@ -217,7 +217,9 @@ class GitHubHeartbeat:
                     print('💓 Heartbeat GitHub terkirim.' if not failed else '✅ Heartbeat GitHub pulih.')
                     failed = False
                 except Exception as exc:
-                    print(f'⚠️ Heartbeat GitHub gagal ({type(exc).__name__}); cek repo/secret/izin/koneksi.')
+                    import re
+                    detail = str(exc) if isinstance(exc, RuntimeError) and re.fullmatch(r'HTTP [1-5][0-9]{2}', str(exc)) else type(exc).__name__
+                    print(f'⚠️ Heartbeat GitHub gagal ({detail}); cek repo/secret/izin/koneksi.')
                     failed = True
         finally:
             session.close()
