@@ -43,17 +43,24 @@ def make_alert(record, baseline):
     delta = record["delta_btc"]
     volume = record["buy_btc"] + record["sell_btc"]
     sign = "POSITIF" if delta > 0 else "NEGATIF"
+    icon = "🟢" if delta > 0 else "🔴"
     ratio = abs(delta) / baseline
+    # Display truncation follows the requested example: 178.8820 -> 178.8.
+    # Calculations and trigger decisions retain their original precision.
+    def btc(value):
+        return math.trunc(value * 10) / 10
+    start = datetime.fromtimestamp(record["start_ms"] / 1000, WIB)
+    end = datetime.fromtimestamp(record["end_ms"] / 1000, WIB)
+    months = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+              "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
     return (
-        f"🚨 DELTA {sign} · {SYMBOL} · {INTERVAL_MINUTES}m\n"
-        f"Periode: {stamp(record['start_ms'])}–"
-        f"{datetime.fromtimestamp(record['end_ms']/1000, WIB).strftime('%H:%M')} WIB\n"
-        f"Buy taker: {record['buy_btc']:,.4f} BTC\n"
-        f"Sell taker: {record['sell_btc']:,.4f} BTC\n"
-        f"Delta: {delta:+,.4f} BTC ({100*delta/volume:+.2f}% volume)\n"
-        f"Avg |delta| {BASELINE_CANDLES} candle tercatat sebelumnya: {baseline:,.4f} BTC\n"
-        f"Rasio: {ratio:.2f}× · Trigger: ≥{DELTA_MULTIPLIER:g}×\n"
-        f"Data: koneksi terpantau tanpa gangguan terdeteksi"
+        f"{icon} {SYMBOL} · {INTERVAL_MINUTES}m | DELTA {sign}\n"
+        f"{start.day:02d} {months[start.month-1]} · {start:%H:%M}–{end:%H:%M} WIB\n\n"
+        f"Buy taker: {btc(record['buy_btc']):,.1f} BTC\n"
+        f"Sell taker: {btc(record['sell_btc']):,.1f} BTC\n"
+        f"Delta: {btc(delta):+,.1f} BTC ({100*delta/volume:+.2f}% volume)\n\n"
+        f"Rasio {ratio:.2f}× · Trigger ≥{DELTA_MULTIPLIER:g}×\n"
+        f"Avg |Δ| {BASELINE_CANDLES} candle: {btc(baseline):,.1f} BTC"
     )
 
 
