@@ -1,4 +1,4 @@
-# @title 1. Siapkan library (tanpa GPU)
+# @title Slewbew Geming
 import importlib.util
 import subprocess
 import sys
@@ -11,7 +11,7 @@ import requests
 import websocket
 if not hasattr(websocket, 'WebSocketApp'):
     raise RuntimeError('Modul websocket tidak cocok. Hapus paket websocket yang berbeda, lalu install websocket-client.')
-print('✅ Library siap. Lanjutkan cell bot dan izinkan Google Drive.')
+print('✅ Library siap — Slewbew Geming.')
 
 """Bybit BTCUSDT delta alerts. Import-safe; no network calls until main()."""
 import json
@@ -30,6 +30,8 @@ INTERVAL_MINUTES = 5
 BASELINE_CANDLES = 24
 DELTA_MULTIPLIER = 4.0
 CLOSE_GRACE_SECONDS = 5
+VOLUME_TOLERANCE_PCT = 1.0  # Relative to official BTC volume, not displayed rounding.
+BYBIT_REST_URL = "https://api.bybit.com/v5/market/kline"
 MAX_HISTORY = 2016  # Up to seven days of 5m records; gaps are not fabricated.
 HISTORY_PATH = "/content/drive/MyDrive/btc-delta-bot/bybit-BTCUSDT-5m.json"
 WIB = timezone(timedelta(hours=7))
@@ -53,6 +55,13 @@ def make_alert(record, baseline):
     end = datetime.fromtimestamp(record["end_ms"] / 1000, WIB)
     months = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+    comparison = ""
+    if "official_volume_btc" in record:
+        comparison = (
+            f"\n\nVolume bot: {btc(volume):,.1f} BTC"
+            f"\nVolume Bybit: {btc(record['official_volume_btc']):,.1f} BTC"
+            f"\nSelisih: {record['volume_diff_pct']:.2f}% · Batas ≤{VOLUME_TOLERANCE_PCT:g}%"
+        )
     return (
         f"{icon} {SYMBOL} · {INTERVAL_MINUTES}m | DELTA {sign}\n"
         f"{start.day:02d} {months[start.month-1]} · {start:%H:%M}–{end:%H:%M} WIB\n\n"
@@ -61,7 +70,79 @@ def make_alert(record, baseline):
         f"Delta: {btc(delta):+,.1f} BTC ({100*delta/volume:+.2f}% volume)\n\n"
         f"Rasio {ratio:.2f}× · Trigger ≥{DELTA_MULTIPLIER:g}×\n"
         f"Avg |Δ| {BASELINE_CANDLES} candle: {btc(baseline):,.1f} BTC"
+        f"{comparison}"
     )
+
+
+class VolumeCheckError(RuntimeError):
+    pass
+
+
+class VolumeGate:
+    """Validate alert candidates against the same closed linear BTCUSDT candle.
+
+    Does not reconstruct missing buy/sell trades or verify historical baselines.
+    HTTP work stays in the sender thread, outside the live trade consumer.
+    """
+    @staticmethod
+    def compare(record, payload):
+        if not record.get('complete'):
+            raise VolumeCheckError('candle parsial atau dibatalkan')
+        if payload.get('retCode') != 0:
+            code = payload.get('retCode')
+            raise VolumeCheckError(f'Bybit retCode {code}' if isinstance(code, int) else 'respons API tidak valid')
+        result = payload.get('result', {})
+        if result.get('symbol') != SYMBOL or result.get('category') != 'linear':
+            raise VolumeCheckError('kontrak respons tidak cocok')
+        if int(payload.get('time', 0)) < record['end_ms']:
+            raise VolumeCheckError('candle resmi belum tutup')
+        rows = result.get('list', [])
+        matches = [r for r in rows if isinstance(r, list) and len(r) >= 7
+                   and str(r[0]) == str(record['start_ms'])]
+        if len(matches) != 1:
+            raise VolumeCheckError('candle resmi periode yang sama belum tersedia')
+        official = float(matches[0][5])
+        bot_volume = record['buy_btc'] + record['sell_btc']
+        if not math.isfinite(official) or official < 0 or not math.isfinite(bot_volume) or bot_volume < 0:
+            raise VolumeCheckError('volume tidak valid')
+        if official == 0:
+            raise VolumeCheckError('volume resmi nol; perbandingan tidak tersedia')
+        diff_pct = abs(bot_volume - official) / official * 100
+        return dict(official_volume_btc=official, volume_diff_pct=diff_pct,
+                    volume_match=diff_pct <= VOLUME_TOLERANCE_PCT + 1e-10)
+
+    def verify(self, session, record, stop_event):
+        last_reason = 'belum diperiksa'
+        for attempt, delay in enumerate((0, 3, 7)):
+            if stop_event.is_set() or (delay and stop_event.wait(delay)):
+                raise VolumeCheckError('bot dihentikan')
+            if not record.get('complete'):
+                raise VolumeCheckError('candle parsial atau dibatalkan')
+            try:
+                response = session.get(BYBIT_REST_URL, params={
+                    'category': 'linear', 'symbol': SYMBOL,
+                    'interval': str(INTERVAL_MINUTES), 'start': record['start_ms'],
+                    'end': record['end_ms']-1, 'limit': 1,
+                }, timeout=(3, 8))
+                if response.status_code != 200:
+                    last_reason = f'Bybit REST HTTP {response.status_code}'
+                    if response.status_code in (400, 401, 403, 404, 429):
+                        break  # Respect denials/rate limits; no alternate host or tight retries.
+                    continue
+                check = self.compare(record, response.json())
+                if check['volume_match']:
+                    if not record.get('complete'):
+                        raise VolumeCheckError('candle dibatalkan saat verifikasi')
+                    return check
+                last_reason = (f"selisih volume {check['volume_diff_pct']:.2f}% "
+                               f"> {VOLUME_TOLERANCE_PCT:g}% "
+                               f"(bot {record['buy_btc']+record['sell_btc']:.4f} / "
+                               f"Bybit {check['official_volume_btc']:.4f} BTC)")
+            except VolumeCheckError as exc:
+                last_reason = str(exc)
+            except Exception as exc:
+                last_reason = f'respons/koneksi REST gagal ({type(exc).__name__})'
+        raise VolumeCheckError(last_reason)
 
 
 class HistoryStore:
@@ -238,6 +319,7 @@ class DeltaBot:
         self.stop_event = threading.Event()
         self.inbox = queue.Queue(maxsize=100000)
         self.outbox = queue.Queue(maxsize=200)
+        self.volume_gate = VolumeGate()
         self.overflow = threading.Event()
         self.store = HistoryStore(history_path)
         self.engine = DeltaEngine(self.store.load())
@@ -354,12 +436,23 @@ class DeltaBot:
         try:
             while not self.stop_event.is_set() or not self.outbox.empty():
                 try:
-                    message = self.outbox.get(timeout=0.5)
+                    job = self.outbox.get(timeout=0.5)
                 except queue.Empty:
+                    continue
+                try:
+                    record = job['record']
+                    check = self.volume_gate.verify(session, record, self.stop_event)
+                    verified = dict(record, **check)
+                    message = make_alert(verified, job['baseline'])
+                    print(f"✅ Volume cocok [{stamp(record['start_ms'])} WIB] · selisih {check['volume_diff_pct']:.2f}%.")
+                except Exception as exc:
+                    reason = str(exc) if isinstance(exc, VolumeCheckError) else type(exc).__name__
+                    print(f'⛔ Alert ditahan: {reason}. Delta tidak dikoreksi dengan volume total.')
+                    self.outbox.task_done()
                     continue
                 delivered = False
                 for attempt in range(3):
-                    if self.stop_event.is_set():
+                    if self.stop_event.is_set() or not record.get("complete"):
                         break
                     wait = 2**attempt
                     try:
@@ -403,6 +496,7 @@ class DeltaBot:
         count = sum(x['complete'] for x in self.engine.history)
         print(f'🟢 Bybit {SYMBOL} · {INTERVAL_MINUTES}m · baseline {BASELINE_CANDLES} · trigger {DELTA_MULTIPLIER:g}×')
         print(f'📂 Histori lengkap dimuat: {count}. Baseline memakai candle tercatat, boleh melintasi jeda sesi.')
+        print(f'🔎 Calon alert wajib cocok dengan volume resmi Bybit; toleransi ≤{VOLUME_TOLERANCE_PCT:g}%.')
         print('ℹ️ Candle awal setelah subscription/reconnect dilewati. Ctrl+C / STOP untuk berhenti.')
         threads = [threading.Thread(target=self._network,daemon=True),
                    threading.Thread(target=self._telegram,daemon=True),
@@ -461,8 +555,8 @@ class DeltaBot:
                         self._save()
                         if alert:
                             try:
-                                self.outbox.put_nowait(alert)
-                                print('📨 Trigger terpenuhi; alert masuk antrean Telegram.')
+                                self.outbox.put_nowait({"record": record, "baseline": baseline})
+                                print('🔎 Trigger terpenuhi; memeriksa volume resmi sebelum kirim Telegram.')
                             except queue.Full:
                                 print('❌ Antrean Telegram penuh; alert ini tidak terkirim.')
                 if time.monotonic()-last_save > 10:
@@ -521,3 +615,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
